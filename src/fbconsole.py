@@ -30,6 +30,7 @@ import webbrowser
 import StringIO
 import six
 from six import b
+from threading import Thread
 
 poster_is_available = False
 try:
@@ -64,6 +65,7 @@ if six.PY3:
     from urllib.request import Request
     from urllib.parse import urlencode
     from urllib.error import HTTPError
+    from http.cookies import SimpleCookie
 else:
     from urllib2 import build_opener
     from urllib2 import HTTPCookieProcessor
@@ -73,6 +75,7 @@ else:
     from urllib2 import HTTPError
     from urllib2 import Request
     from urllib import urlencode
+    from Cookie import SimpleCookie
 
 # import mechanize in python 2.x
 if six.PY3:
@@ -85,6 +88,7 @@ SERVER_PORT = 8080
 ACCESS_TOKEN = None
 CLIENT = None
 ACCESS_TOKEN_FILE = '.fb_access_token'
+COOKIES_FILE = '.fb_cookies'
 AUTH_SCOPE = []
 BATCH_REQUEST_LIMIT = 50
 SANDBOX_DOMAIN = None
@@ -97,6 +101,7 @@ You can close this window now.
 __all__ = [
     'help',
     'authenticate',
+    'authenticate_via_cookie',
     'automatically_authenticate',
     'logout',
     'graph_url',
@@ -187,28 +192,16 @@ class _MultipartPostHandler(BaseHandler):
             buffer += '--%s--\r\n\r\n' % boundary
         return boundary, buffer
 
-
 class _RequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_GET(self):
-        global ACCESS_TOKEN
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
 
         params = parse_qs(urlparse(self.path).query)
-        ACCESS_TOKEN = params.get('access_token', [None])[0]
-        if ACCESS_TOKEN:
-            data = {'scope': AUTH_SCOPE,
-                    'access_token': ACCESS_TOKEN}
-            expiration = params.get('expires_in', [None])[0]
-            if expiration:
-                if expiration == '0':
-                    # this is what's returned when offline_access is requested
-                    data['expires_at'] = 'never'
-                else:
-                    data['expires_at'] = int(time.time()+int(expiration))
-            open(ACCESS_TOKEN_FILE,'w').write(json.dumps(data))
+        authenticated = _save_access_token(params)
+        if authenticated:
             self.wfile.write(b(AUTH_SUCCESS_HTML))
         else:
             self.wfile.write(b('<html><head>'
@@ -253,6 +246,22 @@ class AutomaticLoginError(Exception):
     """
     def __str__(self):
         return self.__class__.__doc__
+
+def _save_access_token(params):
+    global ACCESS_TOKEN
+    ACCESS_TOKEN = params.get('access_token', [None])[0]
+    if ACCESS_TOKEN:
+        data = {'scope': AUTH_SCOPE,
+                'access_token': ACCESS_TOKEN}
+        expiration = params.get('expires_in', [None])[0]
+        if expiration:
+            if expiration == '0':
+                # this is what's returned when offline_access is requested
+                data['expires_at'] = 'never'
+            else:
+                data['expires_at'] = int(time.time()+int(expiration))
+                open(ACCESS_TOKEN_FILE,'w').write(json.dumps(data))
+    return bool(ACCESS_TOKEN)
 
 def _handle_http_error(e):
     body = e.read()
@@ -301,10 +310,10 @@ def _instantiate_browser(debug=False):
     browser.set_handle_referer(True)
     browser.set_handle_robots(False)
     browser.set_handle_refresh(
-        mechanize._http.HTTPRefreshProcessor(), 
+        mechanize._http.HTTPRefreshProcessor(),
         max_time=1,
     )
-    
+
     # add debug logging
     if debug:
         browser.set_debug_http(True)
@@ -336,6 +345,21 @@ delete(path, params) - send a delete request
 fql(query) - make an fql request
 '''
 
+def _authenticate_via_saved_token():
+    """Authenticate with facebook via the saved access token file
+
+    Return True if authenticated successfully, False if otherwise
+    """
+    global ACCESS_TOKEN
+    if os.path.exists(ACCESS_TOKEN_FILE):
+        data = json.loads(open(ACCESS_TOKEN_FILE).read())
+        expires_at = data.get('expires_at')
+        still_valid = expires_at and (expires_at == 'never' or expires_at > time.time())
+        if still_valid and set(data['scope']).issuperset(AUTH_SCOPE):
+            ACCESS_TOKEN = data['access_token']
+            return True
+    return False
+
 def authenticate():
     """Authenticate with facebook so you can make api calls that require auth.
 
@@ -345,17 +369,9 @@ def authenticate():
     If you want to request certain permissions, set the AUTH_SCOPE global
     variable to the list of permissions you want.
     """
-    global ACCESS_TOKEN
-    needs_auth = True
-    if os.path.exists(ACCESS_TOKEN_FILE):
-        data = json.loads(open(ACCESS_TOKEN_FILE).read())
-        expires_at = data.get('expires_at')
-        still_valid = expires_at and (expires_at == 'never' or expires_at > time.time())
-        if still_valid and set(data['scope']).issuperset(AUTH_SCOPE):
-            ACCESS_TOKEN = data['access_token']
-            needs_auth = False
+    authenticated = _authenticate_via_saved_token()
 
-    if needs_auth:
+    if not authenticated:
         webbrowser.open(oauth_url(
                 APP_ID,
                 'http://local.fbconsole.com:%s/' % SERVER_PORT, AUTH_SCOPE
@@ -364,6 +380,47 @@ def authenticate():
         httpd = BaseHTTPServer.HTTPServer(('127.0.0.1', SERVER_PORT), _RequestHandler)
         while ACCESS_TOKEN is None:
             httpd.handle_request()
+
+def authenticate_via_cookie(c_user=None, xs=None):
+    """Authenticate with facebook via cookie
+
+    This function will look for cookie saved in '.fb_cookies'.
+    The cookies values can be overriden by the input parameters.
+    """
+    global ACCESS_TOKEN
+
+    authenticated = _authenticate_via_saved_token()
+
+    if not authenticated:
+        cookies = SimpleCookie()
+        try:
+            with open(COOKIES_FILE) as f:
+                saved_cookies = f.read()
+                cookies.load(saved_cookies)
+        except IOError:
+            pass
+
+        if c_user:
+            cookies['c_user'] = c_user
+        if xs:
+            cookies['xs'] = xs
+        cookie_str = ';'.join(c.key + '=' + c.value for c in cookies.values())
+
+        request = Request(
+            oauth_url(APP_ID, 'https://www.facebook.com/connect/login_success.html', AUTH_SCOPE),
+            headers={'Cookie': cookie_str})
+
+        opener = urlopen(request)
+        try:
+            opener.read()
+            url = opener.geturl()
+        finally:
+            opener.close()
+
+        params = parse_qs(urlparse(url).fragment)
+        authenticated = _save_access_token(params)
+
+        return authenticated
 
 def automatically_authenticate(username, password, app_secret, redirect_uri,
                                debug=False):
@@ -812,7 +869,7 @@ def oauth_url(app_id, redirect_uri, auth_scope):
       'www.facebook.com'
       >>> sorted(parse_qsl(url.query))
       [('client_id', '179745182062082'), ('redirect_uri', 'http://127.0.0.1:8080/'), ('response_type', 'token'), ('scope', 'publish_stream')]
-      
+
 
     """
     return 'https://www.facebook.com/dialog/oauth?' + \
